@@ -1,0 +1,9 @@
+{
+    "name": "sliver-armory-skills",
+    "description": "Claude Code skills for working with Sliver armory extensions. Audit and update extension manifests by cross-referencing source code, CNA scripts, and extension.json to catch issues that would crash the implant.",
+    "version": "1.0.0",
+    "author": {
+        "name": "c2biz"
+    },
+    "repository": "https://github.com/c2biz/sliver-armory-skills"
+}
