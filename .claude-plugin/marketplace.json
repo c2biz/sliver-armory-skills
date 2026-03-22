@@ -1,0 +1,16 @@
+{
+    "name": "sliver-armory-skills",
+    "owner": {
+        "name": "c2biz"
+    },
+    "metadata": {
+        "description": "Claude Code skills for working with Sliver armory extensions"
+    },
+    "plugins": [
+        {
+            "name": "sliver-armory-skills",
+            "source": "./",
+            "description": "Audit and update extension manifests by cross-referencing source code, CNA scripts, and extension.json to catch issues that would crash the implant."
+        }
+    ]
+}
