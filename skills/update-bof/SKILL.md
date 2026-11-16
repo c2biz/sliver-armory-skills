@@ -61,7 +61,7 @@ user before doing anything. The plan should list exactly what changes you'll mak
 
 | Current State | Actions |
 |---|---|
-| No extension.json | Build manifest from scratch using entry.c + CNA |
+| No extension.json | Build manifest from scratch using entry.c + CNA/AXS |
 | V1 manifest | Structural conversion to V2 + arg fixes + doc improvements |
 | V2 manifest, arg issues | Fix argument issues + doc improvements |
 | V2 manifest, docs only | Documentation improvements only |
@@ -87,7 +87,8 @@ user before doing anything. The plan should list exactly what changes you'll mak
    ```
 
 2. **Move these fields into `commands[0]`:**
-   command_name, help, long_help, depends_on, entrypoint, files, arguments
+   command_name, help, long_help, depends_on, entrypoint, files, arguments,
+   and `bof_executor` if present
 
 3. **Set top-level fields:**
    - `name`: Human-readable display name. Convention: "Descriptive Name (Remote)"
@@ -113,6 +114,7 @@ This requires extra caution.
    - Arguments from entry.c (types, order, count — verified)
    - Help text from CNA and entry.c comments
    - Optionality from CNA behavior (but verify BOF handles defaults safely)
+   - Set `depends_on: "coff-loader"` (see BOF Executor Configuration below)
 
 3. **Extra safety gate**: Present the manifest and explicitly ask the user
    to verify the argument list matches their understanding of the BOF.
@@ -149,6 +151,75 @@ Based on check-bof findings, fix argument problems. For each fix:
 - **Adding `"choices"`**: Add for enum-like args where valid values are clear
   from CNA mappings or entry.c logic. Choices are tab-completion hints only
   (not enforced), so they're low-risk to add.
+
+### Action: BOF Executor Configuration
+
+The `bof_executor` field controls how Sliver runs the BOF. See Section 5.1 of
+the reference doc for the full routing table.
+
+**Default stance**: Always ensure `"depends_on": "coff-loader"` is set for BOF
+commands. This is the safe baseline that works on all implant versions.
+
+**Do NOT add `bof_executor` by default.** Manifests with only `depends_on` use
+the COFF loader unconditionally — this is the intended behavior. Only add
+`bof_executor` if the user explicitly requests it.
+
+**If the user requests dual-executor support**: Set both fields:
+```json
+"depends_on": "coff-loader",
+"bof_executor": "reflektor"
+```
+This prefers Reflektor on capable implants and falls back to COFF loader on
+older ones.
+
+**Validation rules to enforce:**
+- `bof_executor: "coff-loader"` REQUIRES non-empty `depends_on` (Sliver
+  rejects the manifest otherwise)
+- Only `""`, `"reflektor"`, and `"coff-loader"` are valid values
+- Never set `bof_executor: "reflektor"` without `depends_on` unless the user
+  explicitly accepts no fallback for older implants
+
+**If `bof_executor` is already present**: Preserve it. Report what execution
+path it produces. If it's `"reflektor"` without `depends_on`, flag the lack
+of fallback as a warning.
+
+**Build pipeline note**: Some repos (notably CS-Situational-Awareness-BOF) have
+packaging systems that inject `bof_executor` at build time. For those repos,
+the source manifest should NOT include `bof_executor` — the build pipeline
+handles it. Flag this if you detect a packaging pipeline (look for
+`armory_packages.py`, `make_bof.sh`, or similar build scripts).
+
+### Action: File Layout and Platform Entries
+
+**File paths in `files` entries** must match actual files on disk.
+
+**Flat layout** (traditional, Windows-only BOFs):
+```json
+"files": [
+    {"os": "windows", "arch": "amd64", "path": "name.x64.o"},
+    {"os": "windows", "arch": "386",   "path": "name.x86.o"}
+]
+```
+
+**Sub-directory layout** (cross-platform BOFs):
+```json
+"files": [
+    {"os": "windows", "arch": "amd64", "path": "dist/windows/amd64/name.o"},
+    {"os": "linux",   "arch": "amd64", "path": "dist/linux/amd64/name.o"},
+    {"os": "darwin",  "arch": "arm64", "path": "dist/darwin/arm64/name.o"}
+]
+```
+
+**Rules:**
+- Match the layout that already exists in the directory. Don't convert between
+  flat and sub-directory without discussion.
+- For Windows-only BOFs, use flat layout with `name.x64.o` / `name.x86.o`.
+  Add `arm64` only if an arm64 `.o` file exists.
+- Cross-platform entries (linux, darwin) require Reflektor — they will not work
+  with COFF loader. Only add them if cross-platform `.o` files actually exist
+  AND the manifest has a Reflektor execution path.
+- Verify every `path` entry points to a real file. Do not generate `files`
+  entries for `.o` files that don't exist.
 
 ### Action: Documentation Improvements
 
@@ -214,6 +285,8 @@ Present to the user:
 2. **Proposed changes** — Exactly what you plan to modify, organized by category:
    - Structural (V1→V2 conversion or new manifest)
    - Safety fixes (type corrections, order fixes)
+   - BOF executor / depends_on changes (if any)
+   - File layout / platform entry changes (if any)
    - Optional/default improvements
    - Documentation improvements (show before → after for each)
    - Items flagged for discussion

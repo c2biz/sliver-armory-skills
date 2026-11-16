@@ -35,9 +35,13 @@ doc in your report.
 The user provides a path to a BOF directory. It may contain any combination of:
 - `extension.json` — Sliver extension manifest (may be V1, V2, or absent)
 - `entry.c` (or other .c/.h source) — BOF C source code
-- A `.cna` file — may be in this directory or elsewhere in the repo
+- A `.cna` file — Cobalt Strike aggressor script (may be in this directory or elsewhere in the repo)
+- A `.axs` file — Adaptix C2 script (functionally equivalent to CNA for manifest work;
+  see Section 9.4 of the reference doc for syntax mapping)
 
-Search for all three. Note what's present and what's missing.
+Search for all of the above. Note what's present and what's missing. When an `.axs`
+file is found, apply the same analysis procedures documented for CNA files — the
+bof_pack format strings, argument definitions, and help text serve the same purpose.
 
 ## Procedure
 
@@ -46,8 +50,12 @@ Search for all three. Note what's present and what's missing.
 Report what you found:
 - **extension.json**: Present (V1/V2) or MISSING
 - **Source code**: path to entry.c or equivalent
-- **CNA**: path to .cna file and the specific command handler within it
+- **CNA/AXS**: path to .cna or .axs file and the specific command handler within it
 - **Compiled .o files**: Do they exist where the manifest references them?
+- **Directory layout**: Flat (`.o` files beside manifest) or sub-directory
+  (`dist/{os}/{arch}/name.o`). Note which pattern is in use.
+- **Platform coverage**: Which OS/arch combos have `.o` files? Windows-only
+  (traditional) or cross-platform?
 
 If extension.json is missing, the remaining checks focus on what a manifest SHOULD
 contain based on entry.c and CNA analysis. This is valuable prep for `/update-bof`.
@@ -74,6 +82,11 @@ Position | BeaconData Call      | C Type/Variable | Used For
 ```
 
 Watch for:
+- **Passthrough pattern**: BOF has exactly one `BeaconDataExtract` call and passes
+  the result to an internal parser (e.g., `/key:value` style). See Section 9.5 of
+  the reference doc. This is common in Adaptix/Rubeus-style BOFs. The manifest
+  needs only one `"string"` argument — do not attempt to decompose the internal
+  `/key:value` structure into discrete manifest arguments.
 - **Conditional reads**: BOF reads different args based on a flag/mode value.
   Flag this — the manifest may not be able to represent it safely.
 - **Loops**: BOF reads a count then loops N times reading more args.
@@ -100,6 +113,8 @@ Find the command handler in the .cna file. Extract:
 Parse the manifest and extract:
 - Format (V1 or V2)
 - command_name, help, long_help
+- `bof_executor`: value or absent (see Section 5.1 of reference doc)
+- `depends_on`: value or absent
 - Argument list: name, type, optional, default, desc, choices
 
 #### 2d: Cross-Reference
@@ -140,7 +155,14 @@ Run structural checks:
 - V2: `name` non-empty; `commands` array non-empty; each command has above
 - All argument `type` values are valid (`string`, `wstring`, `int`, `integer`, `short`, `file`)
 - No path traversal in file paths (`../`)
-- For BOF (.o) files: `depends_on` should be `coff-loader`
+- `bof_executor` validation:
+  - Must be `""` (absent/empty), `"reflektor"`, or `"coff-loader"`
+  - If `"coff-loader"`: `depends_on` must be non-empty (Sliver rejects otherwise)
+  - Any other value: FAIL — Sliver rejects the manifest
+- For BOF (.o) files: `depends_on` should be `coff-loader` for maximum
+  compatibility (ensures COFF loader fallback on all implant versions; see
+  execution path analysis below). A BOF without `depends_on` is valid if it
+  has `bof_executor: "reflektor"`, but has no fallback for older implants.
 
 **Warning (won't crash but should fix):**
 - `entrypoint` missing (fragile)
@@ -149,6 +171,28 @@ Run structural checks:
 - `default` present on required args (ignored, confusing)
 - `"int"` used instead of `"integer"` (inconsistent)
 - Argument `desc` is empty or just repeats the name
+- `.o` file with no `depends_on` and no `bof_executor` — will ONLY work on
+  implants with Reflektor (`CapabilityBOFV1`); fails silently on older implants
+- `bof_executor: "reflektor"` without `depends_on` — no fallback for older implants
+- `files` entries reference paths that don't exist on disk
+
+#### Execution Path Analysis
+
+Based on the `bof_executor` and `depends_on` combination, determine and report
+what execution path the manifest will take. Use the routing table from
+Section 5.1.1 of the reference doc. Report:
+- Which execution mode(s) are possible
+- Whether there's a fallback for older implants
+- Whether the manifest is cross-platform capable (Reflektor) or Windows-only (COFF loader)
+
+#### Directory Layout Check
+
+Verify the `files` entries against actual files on disk:
+- Do the referenced `.o` file paths exist relative to the manifest's directory?
+- Is the layout flat (`name.x64.o`) or sub-directory (`dist/os/arch/name.o`)?
+- For sub-directory layouts: are all referenced OS/arch directories populated?
+- For flat layouts: do the arch-specific filenames follow the `name.{x64,x86}.o`
+  convention?
 
 ### Part 4: Documentation Quality
 
@@ -194,6 +238,11 @@ GOOD / ADEQUATE / POOR / MISSING.
 - Source: <path to entry.c>
 - CNA: <path to .cna> → handler: <command name> | NOT FOUND
 - Build artifacts: <.o files present/missing>
+- Directory layout: flat / sub-directory
+- Platform coverage: <OS/arch list>
+- bof_executor: <value> | absent
+- depends_on: <value> | absent
+- Execution path: <COFFLoader / Reflektor / Reflektor+fallback / ERROR>
 
 ## Argument Audit
 

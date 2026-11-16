@@ -18,6 +18,8 @@ When the sliver repo is present, these are the key files:
 | `client/command/armory/parsers.go` | Armory download logic (tarball/sig filename construction) |
 | `client/assets/extensions.go` | Extension discovery on disk |
 | `client/core/bof.go` | BOFArgsBuffer — binary argument packing sent to the implant |
+| `server/rpc/rpc-extensions.go` | Server-side capability gate for Reflektor (`CapabilityBOFV1` check) |
+| `implant/sliver/handlers/handlers_bof.go` | Implant-side Reflektor BOF executor (cross-platform) |
 
 ---
 
@@ -40,14 +42,15 @@ type ExtensionManifest_ struct {
     Arguments       []*extensionArgument `json:"arguments"`
     Entrypoint      string               `json:"entrypoint"`
     DependsOn       string               `json:"depends_on"`
+    BOFExecutor     string               `json:"bof_executor"`
     Init            string               `json:"init"`
     RootPath        string               `json:"-"`
 }
 ```
 
 Everything is top-level. One manifest = one command. The `command_name`, `help`,
-`files`, `arguments`, `entrypoint`, `depends_on`, and `init` all sit at the top
-level alongside metadata.
+`files`, `arguments`, `entrypoint`, `depends_on`, `bof_executor`, and `init` all
+sit at the top level alongside metadata.
 
 ### 1.2 V2 — Nested, Multi-Command (ExtensionManifest + ExtCommand)
 
@@ -74,6 +77,7 @@ type ExtCommand struct {
     Arguments   []*extensionArgument   `json:"arguments"`
     Entrypoint  string                 `json:"entrypoint"`
     DependsOn   string                 `json:"depends_on"`
+    BOFExecutor string                 `json:"bof_executor"`
     Init        string                 `json:"init"`
     Schema      *packages.OutputSchema `json:"schema"`
     Manifest    *ExtensionManifest     // back-reference, not serialized
@@ -82,6 +86,7 @@ type ExtCommand struct {
 
 Metadata at top level, command(s) in `"commands"` array. New fields:
 - `PackageName` — used for install directory naming
+- `BOFExecutor` — selects the BOF execution engine (see Section 5)
 - `Schema` — per-command structured output formatting
 - `ArmoryName`, `ArmoryPK` — runtime-only, not serialized
 
@@ -147,6 +152,10 @@ Checks performed:
 - `manifest.Name` must be non-empty
 - For each command:
   - `command_name` must be non-empty
+  - `bof_executor` validation:
+    - `""` (empty) and `"reflektor"` — accepted unconditionally
+    - `"coff-loader"` — accepted only if `depends_on` is non-empty (otherwise rejected)
+    - Any other value — rejected
   - `files` must have at least one entry
   - Each file must have non-empty `os`, `arch`, and `path`
   - File paths sanitized via `util.ResolvePath()` (rejects path traversal)
@@ -267,22 +276,80 @@ All integer writes use `binary.LittleEndian`.
 
 ## 5. Execution Flow
 
-### 5.1 runExtensionCmd (load.go)
+### 5.1 BOF Executor and Execution Modes
+
+Sliver supports three execution modes for extensions, determined by the
+`planExtensionExecution` function in load.go:
+
+| Mode | When | How |
+|------|------|-----|
+| `extensionExecutionNative` | Non-BOF (DLL/shared lib) | Direct DLL call via `CallExtensionReq` |
+| `extensionExecutionCOFFLoader` | BOF with external COFF loader | Legacy path: register COFF loader, send BOF data in args |
+| `extensionExecutionReflektor` | BOF with built-in Reflektor | Built-in implant executor: BOF data sent in `CallExtensionReq.BOFData` |
+
+#### 5.1.1 planExtensionExecution Routing
+
+A command is treated as a BOF if `bof_executor` is non-empty OR the file
+extension is `.o`. The routing logic:
+
+| `bof_executor` | `depends_on` | Implant has `CapabilityBOFV1` | Result |
+|---|---|---|---|
+| `""` (empty) | `"coff-loader"` | (doesn't matter) | **COFFLoader** — legacy route preserved |
+| `""` (empty) | `""` (empty) | yes | **Reflektor** |
+| `""` (empty) | `""` (empty) | no | **ERROR** — no execution path |
+| `"coff-loader"` | non-empty | (doesn't matter) | **COFFLoader** |
+| `"coff-loader"` | `""` (empty) | (doesn't matter) | **ERROR** — rejected at validation |
+| `"reflektor"` | non-empty | yes | **Reflektor** (preferred) |
+| `"reflektor"` | non-empty | no | **COFFLoader** — fallback |
+| `"reflektor"` | `""` (empty) | yes | **Reflektor** |
+| `"reflektor"` | `""` (empty) | no | **ERROR** — no fallback |
+
+**Key rule**: Existing manifests with `"depends_on": "coff-loader"` and no
+`bof_executor` field **always** use the COFF loader path, even if the implant
+supports Reflektor. The source comment says: *"Existing manifests infer the
+loader from depends_on. Keep that route even when the target supports the
+built-in executor."*
+
+**New footgun**: A `.o` file with neither `depends_on` nor `bof_executor` will
+ONLY work on implants with `CapabilityBOFV1` (Reflektor). On older implants,
+it fails with no fallback.
+
+#### 5.1.2 Safe Manifest Configurations
+
+From safest to most restrictive:
+
+1. **`"depends_on": "coff-loader"` only** — Always uses COFF loader. Works on
+   all implant versions. Windows-only. This is the traditional pattern.
+
+2. **`"bof_executor": "reflektor"` + `"depends_on": "coff-loader"`** — Prefers
+   Reflektor on capable implants, falls back to COFF loader on older ones.
+   Cross-platform on new implants, Windows-only fallback. Best compatibility.
+
+3. **`"bof_executor": "reflektor"` only** — Reflektor only. Cross-platform
+   but fails on implants without `CapabilityBOFV1`. No fallback.
+
+### 5.2 runExtensionCmd (load.go)
 
 1. Get active session/beacon, determine OS/arch
 2. Look up `ExtCommand` from loaded extensions map
-3. Call `loadExtension` to ensure binary is loaded on implant:
+3. Call `planExtensionExecution` to determine execution mode
+4. If mode is NOT Reflektor, call `loadExtension` to ensure binary is loaded:
    - Compute SHA256 of binary file
    - Check if already loaded (sessions only, not beacons)
    - If `DependsOn` is set, load the dependency (COFF loader) instead
    - Send `RegisterExtensionReq` RPC
-4. Determine if BOF (`.o`) or DLL
-5. **BOF path**: `getBOFArgs` creates BOFArgsBuffer, adds entrypoint string,
-   adds BOF binary data, calls `ParseFlagArgumentsToBuffer` for user args
-6. **DLL path**: joins args with spaces, uses command's own entrypoint
-7. Send `CallExtensionReq` RPC with extension name (SHA256 hash), export, and packed args
+5. Route by mode:
+   - **COFFLoader path**: `getBOFArgs` creates BOFArgsBuffer, adds entrypoint
+     string, adds BOF binary data, calls `ParseFlagArgumentsToBuffer` for user
+     args. Sends via `CallExtensionReq`.
+   - **Reflektor path**: `ParseFlagArgumentsToBuffer` for user args only (no
+     entrypoint/bindata wrapping). BOF binary sent directly in
+     `CallExtensionReq.BOFData` and `IsBOF=true`. The server validates that the
+     target implant has `CapabilityBOFV1` before forwarding.
+   - **Native path**: joins args with spaces, uses command's own entrypoint.
+     Sends via `CallExtensionReq`.
 
-### 5.2 Extension Identity on Implant
+### 5.3 Extension Identity on Implant
 
 Extensions are registered on the implant by the **SHA256 hash of their binary file**,
 not by name. This prevents loading duplicate copies of the same binary. Multiple
@@ -290,9 +357,109 @@ commands can share the same binary (e.g., multi-command manifest with different 
 
 ---
 
-## 6. Installation and Naming
+## 6. Directory Layout and File Paths
 
-### 6.1 Install Directory (install.go)
+### 6.1 Flat Layout (Traditional)
+
+The traditional pattern places `.o` files flat alongside `extension.json`:
+
+```
+bof-name/
+├── extension.json        # "path": "name.x64.o"
+├── name.x64.o
+├── name.x86.o
+└── LICENSE
+```
+
+Manifest `files` entries use bare filenames:
+```json
+"files": [
+    {"os": "windows", "arch": "amd64", "path": "name.x64.o"},
+    {"os": "windows", "arch": "386",   "path": "name.x86.o"}
+]
+```
+
+Tarballs also use this flat structure. This remains the standard layout for
+source-level manifests and Windows-only BOFs.
+
+### 6.2 Sub-directory Layout (Cross-Platform)
+
+The newer pattern uses `dist/{goos}/{goarch}/` sub-directories, primarily for
+BOFs with cross-platform support:
+
+```
+bof-name/
+├── extension.json        # "path": "dist/windows/amd64/name.o"
+├── dist/
+│   ├── windows/
+│   │   ├── 386/name.o
+│   │   ├── amd64/name.o
+│   │   └── arm64/name.o
+│   ├── linux/
+│   │   ├── 386/name.o
+│   │   ├── amd64/name.o
+│   │   └── arm64/name.o
+│   └── darwin/
+│       ├── amd64/name.o
+│       └── arm64/name.o
+└── LICENSE
+```
+
+Manifest `files` entries use relative paths with directory separators:
+```json
+"files": [
+    {"os": "windows", "arch": "amd64", "path": "dist/windows/amd64/name.o"},
+    {"os": "linux",   "arch": "amd64", "path": "dist/linux/amd64/name.o"},
+    {"os": "darwin",  "arch": "arm64", "path": "dist/darwin/arm64/name.o"}
+]
+```
+
+Sliver's `install.go` explicitly supports this: `os.MkdirAll(filepath.Dir(dst))`
+creates intermediate directories when extracting from tarballs. The comment
+says: *"required for extensions with multiple dirs between the .o file and
+the manifest."*
+
+### 6.3 Platform Matrix
+
+Traditional BOFs target Windows only (amd64 + 386). The expanded matrix adds:
+
+| OS | Architectures | Notes |
+|---|---|---|
+| `windows` | `386`, `amd64`, `arm64` | arm64 is new; not all BOFs support it |
+| `linux` | `386`, `amd64`, `arm64` | Requires Reflektor (no COFF loader on Linux) |
+| `darwin` | `amd64`, `arm64` | Requires Reflektor (no COFF loader on macOS) |
+
+Cross-platform targets only apply when the BOF has portable implementations.
+Windows-only BOFs should stick to the traditional Windows entries.
+
+**Build pipeline note**: The CS-Situational-Awareness-BOF packaging system
+(`armory_packages.py`) rewrites `files` arrays and injects cross-platform
+targets at build time. Source-level manifests in that repo still use flat
+Windows-only paths. Other standalone BOF repos manage their own `files` entries.
+
+### 6.4 File Path Resolution (load.go — getFileForTarget)
+
+```go
+if e.Manifest.RootPath != "" {
+    filePath = path.Join(e.Manifest.RootPath, extFile.Path)
+} else {
+    filePath = path.Join(assets.GetExtensionsDir(), e.Manifest.Name, extFile.Path)
+}
+```
+
+Both flat paths (`name.x64.o`) and sub-directory paths (`dist/windows/amd64/name.o`)
+resolve correctly via `path.Join`. `RootPath` is always set during normal loading.
+
+**Note on `package_name` vs `name`**: Because `RootPath` is always set during
+normal loading, `package_name != name` is safe in practice — file resolution
+uses `RootPath`, not `Name`. The `Name`-based fallback path only triggers when
+`RootPath` is empty, which does not occur in normal operation.
+
+---
+
+## 7. Installation and Naming
+
+### 7.1 Install Directory (install.go)
 
 ```go
 packageID := manifestF.Name
@@ -304,24 +471,7 @@ installPath := filepath.Join(assets.GetExtensionsDir(), filepath.Base(packageID)
 
 Priority: `package_name` > `name`.
 
-### 6.2 Runtime File Resolution (load.go — getFileForTarget)
-
-```go
-if e.Manifest.RootPath != "" {
-    filePath = path.Join(e.Manifest.RootPath, extFile.Path)
-} else {
-    filePath = path.Join(assets.GetExtensionsDir(), e.Manifest.Name, extFile.Path)
-}
-```
-
-When `RootPath` is set (ALWAYS during normal loading via `LoadExtensionManifest`),
-files are resolved relative to `RootPath`. The `Name`-based fallback is only used
-when `RootPath` is empty — an edge case that does not occur in normal operation.
-
-**Conclusion: `package_name != name` is safe in practice** because `RootPath` is
-always set. But be aware of the fallback path.
-
-### 6.3 Armory Tarball Naming (armory/parsers.go)
+### 7.2 Armory Tarball Naming (armory/parsers.go)
 
 The armory constructs download URLs as:
 ```
@@ -333,19 +483,19 @@ Where `CommandName` comes from the **armory index** (`armory.json`), not from
 the extension.json. However, the build scripts (make_bof.sh) typically use
 `command_name` from extension.json to name the tarball, so they must stay in sync.
 
-### 6.4 Extension Discovery (assets/extensions.go)
+### 7.3 Extension Discovery (assets/extensions.go)
 
 Scans `~/.sliver-client/extensions/`, finds any subdirectory containing an
 `extension.json`, returns those paths. **Directory name does not matter for discovery.**
 
-### 6.5 "Already Installed" Check (install.go)
+### 7.4 "Already Installed" Check (install.go)
 
 Collects `command_name` values from all installed manifests. Uses `command_name`
 for matching whether a package is already installed.
 
 ---
 
-## 7. Command Registration (load.go — ExtensionRegisterCommand)
+## 8. Command Registration (load.go — ExtensionRegisterCommand)
 
 1. Validates argument types via `checkExtensionArgs`
 2. Builds usage string with argument placeholders:
@@ -360,9 +510,9 @@ for matching whether a package is already installed.
 
 ---
 
-## 8. CNA Cross-Reference Guide
+## 9. CNA Cross-Reference Guide
 
-### 8.1 bof_pack Format Characters
+### 9.1 bof_pack Format Characters
 
 | Char | Type | Equivalent Manifest Type |
 |------|------|-------------------------|
@@ -372,7 +522,7 @@ for matching whether a package is already installed.
 | `s` | 16-bit short | `"short"` |
 | `b` | binary blob (file contents) | `"file"` |
 
-### 8.2 Mapping CNA to Manifest
+### 9.2 Mapping CNA to Manifest
 
 1. Find the `bof_pack` call in the CNA command handler
 2. The format string gives you type sequence (e.g., `"Zzis"` = wstring, string, int, short)
@@ -380,7 +530,7 @@ for matching whether a package is already installed.
 4. **This order MUST match the `arguments` array order in extension.json**
 5. The CNA may reorder user-supplied arguments before calling bof_pack — trace carefully
 
-### 8.3 Common CNA Patterns
+### 9.3 Common CNA Patterns
 
 - `$1`, `$2`, etc. = positional user arguments
 - `iff($N eq "", default, $N)` = optional argument with default
@@ -389,13 +539,59 @@ for matching whether a package is already installed.
 - `bof_pack(...)` = packs arguments into binary format
 - `beacon_inline_execute(...)` = executes the BOF with packed args
 
+### 9.4 Adaptix .axs Patterns
+
+Adaptix C2 uses `.axs` scripts instead of CNA. Functionally equivalent for
+manifest work — same bof_pack concept, different syntax:
+
+- `ax.bof_pack("cstr,wstr,int", [arg1, arg2, arg3])` — comma-separated format
+  string. Types: `cstr` (string), `wstr` (wstring), `int` (integer),
+  `short` (short), `bytes` (file/binary data)
+- `ax.create_command("name", "help text", "usage example")` — command definition
+- `cmd.addArgString("name", true/false, "desc")` — string argument (true=required)
+- `cmd.addArgInt("name", true/false, "desc")` — integer argument
+- `cmd.addArgBool("--flag", "desc")` — boolean flag (packed as int: 0 or 1)
+- `cmd.addArgFlagString("-f", "name", "desc", "default")` — optional flag with default
+- `cmd.addArgFlagFile("--file", "name", required, "desc")` — file argument
+- `parsed_json["name"]` — how the hook reads parsed args before packing
+- `ax.execute_alias(id, cmdline, ...)` — executes the BOF
+
+When both .axs and .cna exist, treat them the same: useful for help text,
+optionality, and defaults, but entry.c is still the source of truth for
+argument types, order, and count.
+
+### 9.5 Passthrough Argument Pattern
+
+Some BOFs (notably from Adaptix/Rubeus-style ports) take a single string via
+`BeaconDataExtract` containing all parameters as `/key:value` pairs. The BOF
+parses this string internally using its own helpers (e.g., `GetStrParam`,
+`IsSetParam`).
+
+Identifying the pattern:
+- entry.c has exactly one `BeaconDataExtract` call after `BeaconDataParse`
+- The extracted string is passed to an internal parser, not used directly
+- The .axs/.cna uses `bof_pack("cstr", [params])` with a single concatenated string
+
+Manifest implications:
+- One `"string"` argument named `params` (or similar)
+- The framework cannot validate, tab-complete, or provide help for individual
+  `/key:value` parameters — that's all opaque to the manifest
+- Optionality depends on whether the BOF handles an empty string gracefully
+- Lower manifest risk (only one arg to get right), higher operator risk
+  (no framework-level input validation)
+
+Do NOT attempt to break passthrough args into discrete manifest arguments
+unless you're also modifying the BOF's C source to use discrete
+`BeaconDataExtract` calls. The manifest argument order must match what the
+BOF actually reads.
+
 ---
 
-## 9. Safety Rules — Crash Scenarios
+## 10. Safety Rules — Crash Scenarios
 
 These manifest errors WILL crash the implant process:
 
-### 9.1 Wrong Argument Order
+### 10.1 Wrong Argument Order
 If the manifest `arguments` array is in a different order than the BOF reads them
 (via `BeaconDataExtract`/`BeaconDataInt`/`BeaconDataShort`), the BOF reads the
 wrong bytes. A string read where an int is expected (or vice versa) produces garbage
@@ -404,33 +600,52 @@ data. Depending on how the BOF uses that data, this causes:
 - Buffer overreads
 - Immediate crash
 
-### 9.2 Wrong Argument Type
+### 10.2 Wrong Argument Type
 If the manifest says `"string"` but the BOF calls `BeaconDataInt`, or vice versa:
 - String packing writes length-prefix + bytes + null
 - Int packing writes exactly 4 bytes
 - The reader consumes the wrong number of bytes
 - All subsequent argument reads are offset → cascading garbage → crash
 
-### 9.3 Missing Arguments (Not Marked Optional)
+### 10.3 Missing Arguments (Not Marked Optional)
 If a required argument is missing, Sliver returns an error to the user. This is SAFE —
 the BOF never executes. The danger is marking an argument as `optional` when the BOF
 actually requires it: the BOF receives a zero/empty default and may crash on null pointer
 dereference or division by zero.
 
-### 9.4 Extra Arguments in Manifest
+### 10.4 Extra Arguments in Manifest
 If the manifest defines MORE arguments than the BOF reads, the extra data sits in the
 buffer unused. This is generally SAFE but wasteful. The BOF stops reading when it has
 what it needs.
 
-### 9.5 Fewer Arguments in Manifest
+### 10.5 Fewer Arguments in Manifest
 If the manifest defines FEWER arguments than the BOF expects, the BOF tries to read
 past the end of the buffer. This causes a buffer underread → garbage or crash.
 
-### 9.6 Wrong Entrypoint
-If the entrypoint name doesn't match a function exported by the BOF, the COFF loader
-cannot resolve it. Behavior depends on loader implementation — may error cleanly or crash.
+### 10.6 Wrong Entrypoint
+If the entrypoint name doesn't match a function exported by the BOF, the loader
+(COFF loader or Reflektor) cannot resolve it. Behavior depends on loader
+implementation — may error cleanly or crash.
 
-### 9.7 Summary: When to STOP
+### 10.7 Compiler-Induced Failures
+
+A BOF can pass all manifest-level validation (correct COFF format, correct
+machine type, `go` entry symbol present) but still crash at runtime due to
+compiler-specific issues:
+
+- **LLVM/Clang-based cross-compilers** (including OLLVM) may produce object
+  files with subtly broken symbol resolution for common libc functions
+  (e.g., `memcpy`, `malloc`). The `.o` file looks correct to `nm` and `file`
+  but crashes when the COFF loader resolves imports at runtime.
+- **GCC version differences**: Newer GCC versions (16+) promote some warnings
+  to errors (e.g., `-Wint-conversion`, `-Wincompatible-function-pointer-types`).
+  BOFs written for older compilers may need additional `-Wno-*` flags.
+
+When diagnosing BOFs that pass verification but fail at runtime, consider the
+compiler before assuming manifest errors. Test with the same compiler the
+upstream project uses (usually `x86_64-w64-mingw32-gcc`).
+
+### 10.8 Summary: When to STOP
 
 **Do not produce a manifest if ANY of these are true:**
 - You cannot determine the argument count with certainty from entry.c

@@ -32,9 +32,37 @@ asks before writing.
 
 ## Install
 
+### From Marketplace
+
 ```
 /plugin marketplace add c2biz/sliver-armory-skills
 /plugin install sliver-armory-skills
+```
+
+### Manual — Persistent (Local Marketplace)
+
+Register the repo as a local marketplace, then install the plugin from it:
+
+```
+/plugin marketplace add /path/to/sliver-armory-skills
+/plugin install sliver-armory-skills@sliver-armory-skills
+```
+
+The install command opens a panel where you pick scope (user, project, or
+local). Once installed, the skills load automatically in every new session.
+
+Or from the shell:
+
+```bash
+claude plugin install sliver-armory-skills@sliver-armory-skills --scope user
+```
+
+### Manual — Single Session
+
+Load the plugin for one session only, no install needed:
+
+```bash
+claude --plugin-dir /path/to/sliver-armory-skills
 ```
 
 ## Usage
